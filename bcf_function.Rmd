@@ -1,0 +1,162 @@
+---
+title: "bcf_function"
+author: "Shiqi Wang"
+date: "2025-04-28"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load necessary libraries
+library(bcf)
+library(dplyr)
+library(Metrics)
+```
+
+```{r}
+# Define the function
+run_bcf_simulation_summary <- function(hetero_effect = TRUE,
+                                       n = 250,
+                                       nonlinear_prognostic = TRUE,
+                                       num_rep = 20) {
+
+  generate_data <- function(n, hetero_effect, nonlinear_prognostic) {
+    x1 <- rnorm(n)
+    x2 <- rnorm(n)
+    x3 <- rnorm(n)
+    x4 <- sample(0:1, n, replace = TRUE)
+    x5 <- sample(1:3, n, replace = TRUE)
+
+    tau <- if (!hetero_effect) {
+      rep(3, n)
+    } else {
+      1 + 2 * x2 * x4
+    }
+
+    g <- c(`1` = 2, `2` = -1, `3` = -4)
+    if (!nonlinear_prognostic) {
+      mu <- 1 + g[as.character(x5)] + x1 * x3
+    } else {
+      mu <- -6 + g[as.character(x5)] + 6 * abs(x3 - 1)
+    }
+
+    s <- sd(mu)
+    pi <- 0.8 * pnorm((3 * mu) / s - 0.5 * x1) + 0.05 + runif(n, 0, 0.1)
+
+    Z <- rbinom(n, 1, pi)
+    Y <- mu + tau * Z + rnorm(n)
+
+    data.frame(x1, x2, x3, x4, x5, tau, mu, pi, Z, Y)
+  }
+
+  results_list <- list()
+
+  for (i in 1:num_rep) {
+    set.seed(123 + i)
+    data <- generate_data(n = n, hetero_effect = hetero_effect, nonlinear_prognostic = nonlinear_prognostic)
+
+    x <- data %>% select(x1, x2, x3, x4, x5) %>% as.matrix()
+    y <- data$Y
+    z <- data$Z
+    pihat <- data$pi
+    true_tau <- data$tau
+
+    fit <- bcf(
+      y = y,
+      z = z,
+      x_control = x,
+      x_moderate = x,
+      pihat = pihat,
+      nburn = 1000,
+      nsim = 1000,
+      ntree_control = 200,
+      ntree_moderate = 50
+    )
+
+    tau_post <- fit$tau
+    tauhat <- colMeans(tau_post)
+
+    tau_lower <- apply(tau_post, 2, quantile, probs = 0.025)
+    tau_upper <- apply(tau_post, 2, quantile, probs = 0.975)
+
+    cate_rmse <- rmse(true_tau, tauhat)
+    cate_cover <- mean(true_tau >= tau_lower & true_tau <= tau_upper)
+    cate_len <- mean(tau_upper - tau_lower)
+
+    ate_true <- mean(true_tau)
+    ate_estimate <- mean(tauhat)
+    ate_rmse <- sqrt((ate_estimate - ate_true)^2)
+
+    ate_lower <- quantile(rowMeans(tau_post), 0.025)
+    ate_upper <- quantile(rowMeans(tau_post), 0.975)
+
+    ate_cover <- as.numeric(ate_true >= ate_lower & ate_true <= ate_upper)
+    ate_len <- ate_upper - ate_lower
+
+    results_list[[i]] <- tibble(
+      rep = i,
+      ate_rmse = ate_rmse,
+      ate_cover = ate_cover,
+      ate_len = ate_len,
+      cate_rmse = cate_rmse,
+      cate_cover = cate_cover,
+      cate_len = cate_len
+    )
+  }
+
+  results_df <- bind_rows(results_list)
+
+  summary_results <- results_df %>%
+    summarise(
+      ate_rmse = mean(ate_rmse, na.rm = TRUE),
+      ate_cover = mean(ate_cover, na.rm = TRUE),
+      ate_len = mean(ate_len, na.rm = TRUE),
+      cate_rmse = mean(cate_rmse, na.rm = TRUE),
+      cate_cover = mean(cate_cover, na.rm = TRUE),
+      cate_len = mean(cate_len, na.rm = TRUE)
+    )
+
+  # Create dynamic name for output
+  hetero_label <- ifelse(hetero_effect, "hetero", "homo")
+  linearity_label <- ifelse(nonlinear_prognostic, "nonlinear", "linear")
+
+  assign(
+    paste0("res_", hetero_label, "_", n, "_", linearity_label, "_bcf"),
+    summary_results,
+    envir = .GlobalEnv
+  )
+}
+
+# Example usage:
+# run_bcf_simulation_summary(hetero_effect = TRUE, n = 250, nonlinear_prognostic = TRUE)
+
+```
+
+```{r}
+# Start Time
+start_time <- Sys.time()
+
+
+# Run function
+run_bcf_simulation_summary(hetero_effect = TRUE, n = 250, nonlinear_prognostic = FALSE)
+
+# Calculate the time difference
+end_time <- Sys.time()
+time_taken <- end_time - start_time
+print(time_taken)
+
+```
+```{r}
+
+##save to file, change name
+# write.csv(res_hetero_250_linear_bcf, file = "res_hetero_250_linear_bcf.csv", row.names = FALSE)
+```
+
+
+
+
+
+
