@@ -14,14 +14,15 @@ knitr::opts_chunk$set(echo = TRUE)
 library(bcf)
 library(dplyr)
 library(Metrics)
+library(purrr)
 ```
 
 ```{r}
 # Define the function
-run_bcf_simulation_summary <- function(hetero_effect = TRUE,
-                                       n = 250,
-                                       nonlinear_prognostic = TRUE,
-                                       num_rep = 20) {
+run_bcf_simulation_summary <- function(hetero_effect,
+                                       n,
+                                       nonlinear_prognostic,
+                                       num_rep) {
 
   generate_data <- function(n, hetero_effect, nonlinear_prognostic) {
     x1 <- rnorm(n)
@@ -55,14 +56,16 @@ run_bcf_simulation_summary <- function(hetero_effect = TRUE,
   results_list <- list()
 
   for (i in 1:num_rep) {
+    cat("Running repetition:", i, "out of", num_rep, "\n")
     set.seed(123 + i)
     data <- generate_data(n = n, hetero_effect = hetero_effect, nonlinear_prognostic = nonlinear_prognostic)
 
     x <- data %>% select(x1, x2, x3, x4, x5) %>% as.matrix()
     y <- data$Y
     z <- data$Z
-    pihat <- data$pi
     true_tau <- data$tau
+    p.score <- glm(Z~x, family = binomial, data = data)
+    pihat <- predict(p.score, as.data.frame(x))
 
     fit <- bcf(
       y = y,
@@ -73,7 +76,8 @@ run_bcf_simulation_summary <- function(hetero_effect = TRUE,
       nburn = 1000,
       nsim = 1000,
       ntree_control = 200,
-      ntree_moderate = 50
+      ntree_moderate = 50,
+      verbose = FALSE
     )
 
     tau_post <- fit$tau
@@ -105,6 +109,8 @@ run_bcf_simulation_summary <- function(hetero_effect = TRUE,
       cate_cover = cate_cover,
       cate_len = cate_len
     )
+    
+    saveRDS(results_list[[i]], file = paste0("bcf_results_rep_", i, ".rds"))
   }
 
   results_df <- bind_rows(results_list)
@@ -141,7 +147,10 @@ start_time <- Sys.time()
 
 
 # Run function
-run_bcf_simulation_summary(hetero_effect = TRUE, n = 250, nonlinear_prognostic = FALSE)
+run_bcf_simulation_summary(hetero_effect = TRUE, 
+                           n = 500, 
+                           nonlinear_prognostic = FALSE,
+                           num_rep = 20)
 
 # Calculate the time difference
 end_time <- Sys.time()
@@ -149,14 +158,26 @@ time_taken <- end_time - start_time
 print(time_taken)
 
 ```
+
+
 ```{r}
+num_rep <- 20
+results_df <- map_dfr(1:num_rep, ~ readRDS(paste0("bcf_results_rep_", .x, ".rds")))
+print(results_df)
 
-##save to file, change name
-# write.csv(res_hetero_250_linear_bcf, file = "res_hetero_250_linear_bcf.csv", row.names = FALSE)
+# Calculate summary results
+summary_results <- results_df %>%
+  summarise(
+    ate_rmse   = mean(ate_rmse, na.rm = TRUE),
+    ate_cover  = mean(ate_cover, na.rm = TRUE),
+    ate_len    = mean(ate_len, na.rm = TRUE),
+    cate_rmse  = mean(cate_rmse, na.rm = TRUE),
+    cate_cover = mean(cate_cover, na.rm = TRUE),
+    cate_len   = mean(cate_len, na.rm = TRUE)
+  )
+
+print(summary_results)
 ```
-
-
-
 
 
 
