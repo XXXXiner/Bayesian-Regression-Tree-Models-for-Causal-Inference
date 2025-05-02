@@ -12,10 +12,12 @@ knitr::opts_chunk$set(echo = TRUE)
 ```{r}
 library(dplyr)
 library(Metrics)
+library(glmnet)
+library(ggplot2)
+library(tidyr)
+```
 
-# -----------------------------
-# Data generation function 
-# -----------------------------
+```{r}
 generate_data <- function(n, hetero_effect, nonlinear_prognostic) {
   x1 <- rnorm(n)
   x2 <- rnorm(n)
@@ -44,93 +46,382 @@ generate_data <- function(n, hetero_effect, nonlinear_prognostic) {
   
   data.frame(x1, x2, x3, x4, x5, tau, mu, pi, Z, Y)
 }
+```
 
-# -----------------------------
-# Function to run GLM simulation
-# -----------------------------
-run_glm_simulation_summary <- function(hetero_effect = TRUE,
-                                       n = 250,
-                                       nonlinear_prognostic = TRUE,
-                                       num_rep = 1) {
+```{r}
+# ----------------------------------------
+# Bootstrapped GLM simulation (GLM without Lasso) JUST FOR ILLUSTRATION 
+# ----------------------------------------
+run_glm_simulation_boot <- function(hetero_effect = TRUE,
+                                    n = 250,
+                                    nonlinear_prognostic = TRUE,
+                                    num_rep = 1,
+                                    B = 200) {
   
-  results_list <- list()
+  results_list <- vector("list", num_rep)
   
-  for (i in 1:num_rep) {
+  for (i in seq_len(num_rep)) {
     set.seed(123 + i)
-    data <- generate_data(n = n, hetero_effect = hetero_effect, nonlinear_prognostic = nonlinear_prognostic)
+    data   <- generate_data(n, hetero_effect, nonlinear_prognostic)
     
+    # glm fit, add x1 times x3 and Z:x2:x4
+    glm_fit  <- glm(
+      # Y ~ Z + x1 + x2 + x3 + factor(x4) + factor(x5) + I(x1 * x3) + Z:x2:factor(x4),
+      Y ~ (Z + x1 + x2 + x3 + factor(x4) + factor(x5))^3, 
+      data = data, family = gaussian(link = "identity")
+    ) 
     
-    glm_fit <- glm(Y ~ Z * (x1 + x2 + x3 + factor(x4) + factor(x5)), data = data)
-    print(summary(glm_fit))
+    #print(summary(glm_fit))
     
-    # Predicted outcome with and without treatment
-    data1 <- data
-    data1$Z <- 1
-    data0 <- data
-    data0$Z <- 0
+    # preds at Z=1 and Z=0
+    pred1_o  <- predict(glm_fit,  newdata = transform(data, Z = 1))
+    pred0_o  <- predict(glm_fit,  newdata = transform(data, Z = 0))
+    tauhat_o <- pred1_o - pred0_o          # CATE tau estimation at individual level
+    ate_o    <- mean(tauhat_o)             # ATE estimation
     
-    pred1 <- predict(glm_fit, newdata = data1)
-    pred0 <- predict(glm_fit, newdata = data0)
+    # Bootstrap loop
+    n_obs    <- nrow(data)
+    tau_boot <- matrix(NA, nrow = B, ncol = n_obs)
+    ate_boot <- numeric(B)
     
-    tauhat <- pred1 - pred0  # Estimated tauhat (treatment effect)
+    for (b in seq_len(B)) {
+      idx       <- sample.int(n_obs, replace = TRUE)
+      dboot     <- data[idx, ]
+      glm_b     <- glm(
+        # Y ~ Z + x1 + x2 + x3 + factor(x4) + factor(x5) + I(x1 * x3) + Z:x2:factor(x4),
+        Y ~ (Z + x1 + x2 + x3 + factor(x4) + factor(x5))^3,
+        data = dboot, family = gaussian(link = "identity")
+      )
+      print(summary(glm_b))
+      
+      
+      p1b       <- predict(glm_b, newdata = transform(data, Z = 1))
+      p0b       <- predict(glm_b, newdata = transform(data, Z = 0))
+      tau_b     <- p1b - p0b
+      tau_boot[b, ] <- tau_b
+      ate_boot[b]   <- mean(tau_b)
+    }
     
+    # 95% CIs
+    tau_lower <- apply(tau_boot, 2, quantile, probs = 0.025)
+    tau_upper <- apply(tau_boot, 2, quantile, probs = 0.975)
     
-    cate_rmse <- rmse(data$tau, tauhat)
+    ate_lower <- quantile(ate_boot, probs = 0.025)
+    ate_upper <- quantile(ate_boot, probs = 0.975)
     
-    # Approximate uncertainty by standard error (not very accurate), use as a comparative metric with other model
-    se <- summary(glm_fit)$coefficients["Z", "Std. Error"]
-    tau_lower <- tauhat - 1.96 * se
-    tau_upper <- tauhat + 1.96 * se
+    # Coverage / length
     cate_cover <- mean(data$tau >= tau_lower & data$tau <= tau_upper)
-    cate_len <- mean(tau_upper - tau_lower)
+    cate_len   <- mean(tau_upper - tau_lower)
     
+    ate_cover  <- as.numeric(mean(data$tau) >= ate_lower &
+                             mean(data$tau) <= ate_upper)
+    ate_len    <- as.numeric(ate_upper - ate_lower)
     
-    ate_true <- mean(data$tau)
-    ate_estimate <- mean(tauhat)
-    ate_rmse <- sqrt((ate_estimate - ate_true)^2)
+    # RMSE
+    cate_rmse  <- rmse(data$tau, tauhat_o)
+    ate_rmse   <- sqrt((ate_o - mean(data$tau))^2)
     
-    ate_lower <- mean(tauhat) - 1.96 * se
-    ate_upper <- mean(tauhat) + 1.96 * se
-    ate_cover <- as.numeric(ate_true >= ate_lower & ate_true <= ate_upper)
-    ate_len <- ate_upper - ate_lower
-    
-    # ATE len = CATE len (2 * 1.96 * se)
     results_list[[i]] <- tibble(
-      rep = i,
-      ate_rmse = ate_rmse,
-      ate_cover = ate_cover,
-      ate_len = ate_len,
-      cate_rmse = cate_rmse,
+      rep        = i,
+      ate_rmse   = ate_rmse,
+      ate_cover  = ate_cover,
+      ate_len    = ate_len,
+      cate_rmse  = cate_rmse,
       cate_cover = cate_cover,
-      cate_len = cate_len
+      cate_len   = cate_len
     )
   }
   
-  results_df <- bind_rows(results_list)
-  
-  summary_results <- results_df %>%
+  bind_rows(results_list) %>%
     summarise(
-      ate_rmse = mean(ate_rmse, na.rm = TRUE),
-      ate_cover = mean(ate_cover, na.rm = TRUE),
-      ate_len = mean(ate_len, na.rm = TRUE),
-      cate_rmse = mean(cate_rmse, na.rm = TRUE),
+      ate_rmse   = mean(ate_rmse,   na.rm = TRUE),
+      ate_cover  = mean(ate_cover,  na.rm = TRUE),
+      ate_len    = mean(ate_len,    na.rm = TRUE),
+      cate_rmse  = mean(cate_rmse,  na.rm = TRUE),
       cate_cover = mean(cate_cover, na.rm = TRUE),
-      cate_len = mean(cate_len, na.rm = TRUE)
-    )
-  
-  print(summary_results)
+      cate_len   = mean(cate_len,   na.rm = TRUE)
+    ) %>% print()
 }
 
 ```
 
 ```{r}
+# For illustration if want to see summary
+run_glm_simulation_boot(hetero_effect = TRUE,
+                                    n = 250,
+                                    nonlinear_prognostic = FALSE,
+                                    num_rep = 1,
+                                    B = 200)
+```
 
+
+```{r}
+# --------------------------------------------------------------------
+# Bootstrapped GLM (lasso) simulation with three-way interactions (Final Function)
+# --------------------------------------------------------------------
+run_glm_simulation_boot <- function(hetero_effect = TRUE,
+                                    n = 250,
+                                    nonlinear_prognostic = TRUE,
+                                    num_rep = 1,
+                                    B = 200) {
+  
+  results_list <- vector("list", num_rep)
+  
+  for (i in seq_len(num_rep)) {
+    set.seed(123 + i)
+    data <- generate_data(n, hetero_effect, nonlinear_prognostic)
+    
+    X_orig <- model.matrix(
+      ~ (Z + x1 + x2 + x3 + factor(x4) + factor(x5))^3,
+      data = data
+    )[, -1]
+    Y_orig <- data$Y
+    
+    # best lambda
+    cv0    <- cv.glmnet(x = X_orig, y = Y_orig,
+                        alpha = 1, family = "gaussian", nfolds = 10)
+    lam0   <- cv0$lambda.min
+    fit0   <- glmnet(x = X_orig, y = Y_orig,
+                     alpha = 1, lambda = lam0, family = "gaussian")
+    
+    # build prediction matrices for original data at Z=1 and Z=0
+    new1       <- data; new1$Z <- 1
+    new0       <- data; new0$Z <- 0
+    X1_orig   <- model.matrix(
+      ~ (Z + x1 + x2 + x3 + factor(x4) + factor(x5))^3,
+      data = new1
+    )[, -1]
+    X0_orig   <- model.matrix(
+      ~ (Z + x1 + x2 + x3 + factor(x4) + factor(x5))^3,
+      data = new0
+    )[, -1]
+    
+    # point estimates on original
+    p1_orig   <- predict(fit0, newx = X1_orig)
+    p0_orig   <- predict(fit0, newx = X0_orig)
+    tauhat_o  <- as.numeric(p1_orig - p0_orig)
+    ate_o     <- mean(tauhat_o)
+    
+    n_obs     <- nrow(data)
+    tau_boot  <- matrix(NA, nrow = B, ncol = n_obs)
+    ate_boot  <- numeric(B)
+    
+    # ---- Bootstrap loop ----
+    for (b in seq_len(B)) {
+      idx     <- sample.int(n_obs, replace = TRUE)
+      dboot   <- data[idx, ]
+      
+      X_boot  <- model.matrix(
+        ~ (Z + x1 + x2 + x3 + factor(x4) + factor(x5))^3,
+        data = dboot
+      )[, -1]
+      Y_boot  <- dboot$Y
+      
+      # refit lasso, skipped cv and reuse lam0
+      # cvb     <- cv.glmnet(x = X_boot, y = Y_boot, alpha = 1, family = "gaussian", nfolds = 10)
+      # lamb    <- cvb$lambda.min
+      fitb    <- glmnet(x = X_boot, y = Y_boot,
+                        alpha = 1, lambda = lam0, family = "gaussian")
+      
+      # predict CATE on ORIGINAL data
+      p1b     <- predict(fitb, newx = X1_orig)
+      p0b     <- predict(fitb, newx = X0_orig)
+      tau_b   <- as.numeric(p1b - p0b)
+      
+      tau_boot[b, ] <- tau_b
+      ate_boot[b]   <- mean(tau_b)
+    }
+    
+    # empirical 95% CIs
+    tau_lower <- apply(tau_boot, 2, quantile, probs = 0.025)
+    tau_upper <- apply(tau_boot, 2, quantile, probs = 0.975)
+    ate_lower <- quantile(ate_boot, probs = 0.025)
+    ate_upper <- quantile(ate_boot, probs = 0.975)
+    
+    # coverage and length
+    cate_cover <- mean(data$tau >= tau_lower & data$tau <= tau_upper)
+    cate_len   <- mean(tau_upper - tau_lower)
+    ate_cover  <- as.numeric(mean(data$tau) >= ate_lower &&
+                             mean(data$tau) <= ate_upper)
+    ate_len    <- as.numeric(ate_upper - ate_lower)
+    
+    # RMSE
+    cate_rmse  <- rmse(data$tau, tauhat_o)
+    ate_rmse   <- sqrt((ate_o - mean(data$tau))^2)
+    
+    results_list[[i]] <- tibble(
+      rep        = i,
+      ate_rmse   = ate_rmse,
+      ate_cover  = ate_cover,
+      ate_len    = ate_len,
+      cate_rmse  = cate_rmse,
+      cate_cover = cate_cover,
+      cate_len   = cate_len
+    )
+  }
+  
+  bind_rows(results_list) %>%
+    summarise(
+      ate_rmse   = mean(ate_rmse,   na.rm = TRUE),
+      ate_cover  = mean(ate_cover,  na.rm = TRUE),
+      ate_len    = mean(ate_len,    na.rm = TRUE),
+      cate_rmse  = mean(cate_rmse,  na.rm = TRUE),
+      cate_cover = mean(cate_cover, na.rm = TRUE),
+      cate_len   = mean(cate_len,   na.rm = TRUE)
+    ) %>%
+    print()
+}
+
+```
+
+```{r}
+# Output table
 start_time <- Sys.time()
+params <- expand.grid(
+  hetero_effect        = c(FALSE, TRUE),
+  n                    = c(250, 500),
+  nonlinear_prognostic = c(FALSE, TRUE),
+  stringsAsFactors     = FALSE
+)
 
-run_glm_simulation_summary(hetero_effect = TRUE, n = 250, nonlinear_prognostic = FALSE, num_rep = 50)
 
+results <- vector("list", nrow(params))
+
+for (i in seq_len(nrow(params))) {
+ 
+  he   <- params$hetero_effect[i]
+  n_i  <- params$n[i]
+  nl   <- params$nonlinear_prognostic[i]
+  
+  sim_sum <- run_glm_simulation_boot(
+    hetero_effect        = he,
+    n                    = n_i,
+    nonlinear_prognostic = nl,
+    num_rep              = 50,
+    B                    = 500
+  )
+  
+  
+  sim_sum <- sim_sum %>%
+    mutate(
+      n                    = n_i,
+      heterogeneous        = he,
+      nonlinear_prognostic = nl
+    ) %>%
+    select(n, heterogeneous, nonlinear_prognostic, everything())
+  
+  
+  results[[i]] <- sim_sum
+}
+
+final_table2 <- bind_rows(results)
+
+print(final_table2)
 end_time <- Sys.time()
 time_taken <- end_time - start_time
 print(time_taken)
+```
 
+```{r}
+# Function to plot bootstrapped coefficients
+get_bootstrap_coefs <- function(hetero_effect, n, nonlinear_prognostic, B = 500) {
+  data <- generate_data(n, hetero_effect, nonlinear_prognostic)
+  X_orig <- model.matrix( ~ (Z + x1 + x2 + x3 + factor(x4) + factor(x5))^3,
+                          data = data )[, -1]
+  Y_orig <- data$Y
+  lam0   <- cv.glmnet(X_orig, Y_orig, alpha=1, family="gaussian", nfolds=10)$lambda.min
+
+  beta_names <- setdiff(rownames(coef(glmnet(X_orig, Y_orig, alpha=1, lambda=lam0))), "(Intercept)")
+  
+  bootstrap_coefs <- matrix(
+    NA, nrow = B, ncol = length(beta_names),
+    dimnames = list(NULL, beta_names)
+  )
+  
+  for (b in seq_len(B)) {
+    samp <- data[sample(nrow(data), replace=TRUE), ]
+    Xb   <- model.matrix( ~ (Z + x1 + x2 + x3 + factor(x4) + factor(x5))^3,
+                          data = samp )[, -1]
+    Yb   <- samp$Y
+    fitb <- glmnet(Xb, Yb, alpha=1, lambda=lam0, family="gaussian")
+    bootstrap_coefs[b, ] <- as.numeric(coef(fitb, s = lam0)[beta_names, ])
+  }
+  return(bootstrap_coefs)
+}
+
+plot_top4_boot_coefs <- function(bootstrap_coefs,
+                                 hetero_effect,
+                                 nonlinear_prognostic) {
+  # Compute mean coefficient and pick top 4 by absolute value
+  mean_coefs <- colMeans(bootstrap_coefs, na.rm = TRUE)
+  top5       <- names(sort(abs(mean_coefs), decreasing = TRUE))[1:4]
+  
+  
+  df <- as.data.frame(bootstrap_coefs[, top5, drop = FALSE])
+  df$iter <- seq_len(nrow(df))
+  long_df <- pivot_longer(
+    df,
+    cols      = all_of(top5),
+    names_to  = "Variable",
+    values_to = "Estimate"
+  )
+  
+  
+  effect_type <- if (hetero_effect) "Heterogeneous" else "Homogeneous"
+  model_type  <- if (nonlinear_prognostic) "Nonlinear" else "Linear"
+  title_text  <- sprintf(
+    "Bootstrap Coefficients: %s Effects & %s DGP",
+    effect_type, model_type
+  )
+  
+  p <- ggplot(long_df, aes(x = Variable, y = Estimate, fill = Variable)) +
+    geom_boxplot(outlier.size = 1, alpha = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    coord_flip() +
+   labs(
+    title   = "Bootstrap Penalized GLM (Lasso) Coefficient Estimates\n(Top 4 by |mean|)",
+  )  +
+    scale_fill_manual(values = setNames(
+  c("lightpink1", "lightgoldenrod1", "lightcyan1", "lightblue1", "palegreen1"), top5
+)) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 14, hjust = 0.5),
+      axis.title.x     = element_text(size = 12),
+      axis.text        = element_text(size = 12),
+      legend.position  = "top",
+      legend.title     = element_text(face = "bold"),
+      panel.grid.major = element_line(color = "grey90")
+    )
+  
+  print(p)
+  invisible(p)
+}
+
+```
+
+```{r}
+coefs <- get_bootstrap_coefs(
+  hetero_effect        = FALSE,
+  n                    = 500,
+  nonlinear_prognostic = FALSE,
+  B                    = 500
+)
+
+p <- plot_top4_boot_coefs(
+  bootstrap_coefs      = coefs,
+  hetero_effect        = FALSE,
+  nonlinear_prognostic = FALSE
+)
+p
+```
+
+```{r}
+ggsave(
+  filename = "bootstrap_top4_coeffs.png",
+  plot     = p,        
+  width    = 8,        
+  height   = 3,        
+  dpi      = 300       
+)
 ```
