@@ -1,0 +1,214 @@
+---
+title: "bart"
+author: "Kathy Wu"
+date: "2025-04-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(bartCause)
+library(dplyr)
+library(purrr) 
+```
+## Data
+
+```{r}
+# -----------------------------
+# Data generation function
+# -----------------------------
+generate_data <- function(n, hetero_effect, nonlinear_prognostic) {
+  x1 <- rnorm(n)
+  x2 <- rnorm(n)
+  x3 <- rnorm(n)
+  x4 <- sample(0:1, n, replace = TRUE)
+  x5 <- sample(1:3, n, replace = TRUE)
+  
+  # Treatment effect
+  tau <- if (!hetero_effect) {
+    rep(3, n)
+  } else {
+    1 + 2 * x2 * x5
+  }
+  
+  # Prognostic function
+  g <- c(`1` = 2, `2` = -1, `3` = -4)
+  if (!nonlinear_prognostic) {
+    mu <- 1 + g[as.character(x5)] + x1 * x3
+  } else {
+    mu <- -6 + g[as.character(x5)] + 6 * abs(x3 - 1)
+  }
+  
+  # Propensity score
+  s <- sd(mu)
+  pi <- 0.8 * pnorm((3 * mu) / s - 0.5 * x1) + 0.05 + runif(n, 0, 1) / 10
+  
+  # Treatment assignment
+  Z <- rbinom(n, 1, pi)
+  
+  bz <- rnorm(n,0,sqrt(1/2))
+  b10 <- rnorm(n)
+  # Outcome variable
+  Y <- mu + tau * Z  + rnorm(n)
+  
+  #true_tau <- b10 * tau
+  
+  # Return dataframe
+  data.frame(x1, x2, x3, x4, x5 = factor(x5, levels = 1:3), tau, mu, pi, Z, Y)
+}
+
+```
+
+## Bart
+
+```{r}
+run_sim <- function(n, hetero_effect, nonlinear_prognostic, num_rep) {
+  print("Starting...")
+  print(paste(">>> ", "n: ", n, "| hetero: ", hetero_effect, "| nonlinear: ", nonlinear_prognostic))
+  
+  # store results
+  results_list <- list()
+  
+  for (i in seq_len(num_rep)) {
+    set.seed(123 + i)
+    if (i %% 10 == 0) {
+      print(i)
+    }
+    
+    # generate data
+    data <- generate_data(
+      n = n,
+      hetero_effect = hetero_effect,
+      nonlinear_prognostic = nonlinear_prognostic
+    )
+    
+    # ps-BART model
+    Y <- as.matrix(data$Y)
+    Z <- as.matrix(data$Z)
+    X <- data %>% select(x1, x2, x3, x4, x5) 
+    
+    # fit model
+    invisible(
+      capture.output({
+        bart_fit <- bartc(
+          Y, Z, X,
+          method.trt = "bart",
+          p.scoreAsCovariate = TRUE, # propensity score estimation
+          n.burn = 1000,
+          n.samples = 1000,
+          keepTrees = TRUE
+        )
+      })
+    )
+    
+    s <- summary(bart_fit)
+    #print(s)
+    
+    # estimate tau
+    #pred_tau <- fitted(bart_fit, type = "ite")
+    pred_tau_post <- predict(bart_fit, newdata = X, type = "ite") # matrix
+    #print(dim(pred_tau_post))
+    pred_tau <- colMeans(pred_tau_post)
+    true_tau <- data$tau
+    #true_tau <- data$true_tau
+    mean_tau <- mean(true_tau)  # mean of true tau
+    
+    mu1_draws <- predict(bart_fit, newdata = X, type = "mu.1")  # S × n
+    mu0_draws <- predict(bart_fit, newdata = X, type = "mu.0")  # S × n
+    tau_draws <- mu1_draws - mu0_draws
+    #print(dim(tau_draws))
+    
+    # ATE
+    est_ate <- s$estimates$estimate
+    ate_rmse <- sqrt((est_ate - mean_tau)^2)
+    ate_cover <- (s$estimates$ci.lower <= mean_tau & mean_tau <= s$estimates$ci.upper)
+    ate_len <- s$estimates$ci.upper - s$estimates$ci.lower
+    
+    # CATE
+    res_cate <- data.frame(
+      true_tau = true_tau,
+      pred_tau = pred_tau,
+      #tau_lower = apply(pred_tau_post, 2, quantile, probs = 0.025, names = FALSE),
+      #tau_upper = apply(pred_tau_post, 2, quantile, probs = 0.975, names = FALSE)
+      tau_lower = apply(tau_draws, 2, quantile, probs = 0.025, names = FALSE),
+      tau_upper = apply(tau_draws, 2, quantile, probs = 0.975, names = FALSE)
+      ) %>%
+      mutate(
+        err = pred_tau - true_tau,
+        covered = (tau_lower <= true_tau & true_tau <= tau_upper),
+        len = tau_upper - tau_lower
+      )
+    #print(mean(res_cate$tau_lower))
+    #print(mean(res_cate$tau_upper))
+      
+    cate_rmse <- sqrt(mean(res_cate$err^2))
+    cate_cover <- mean(res_cate$covered)
+    cate_len <- mean(res_cate$len)
+    
+    # store results
+    results_list[[i]] <- tibble(
+      rep = i,
+      ate_rmse = ate_rmse,
+      ate_cover = ate_cover,
+      ate_len = ate_len,
+      cate_rmse = cate_rmse,
+      cate_cover = cate_cover,
+      cate_len = cate_len
+    )
+  }
+  
+  # summarize over the num_rep
+  results_df <- bind_rows(results_list)
+  summary_results <- results_df %>% 
+    summarize(
+    ate_rmse = mean(ate_rmse, na.rm = TRUE),
+    ate_cover = mean(ate_cover, na.rm = TRUE),
+    ate_len = mean(ate_len, na.rm = TRUE),
+    cate_rmse = mean(cate_rmse, na.rm = TRUE),
+    cate_cover = mean(cate_cover, na.rm = TRUE),
+    cate_len = mean(cate_len, na.rm = TRUE)
+    )
+  
+  # summarize results
+  summary_results %>%
+    mutate(
+      n = n,
+      hetero_effect = ifelse(
+        hetero_effect,
+        "Heterogeneous",
+        "Homogeneous"
+      ),
+      nonlinear_prognostic = ifelse(
+        nonlinear_prognostic,
+        "NonLinear",
+        "Linear"
+      )
+    )
+}
+
+```
+
+```{r}
+# parameter grid
+combo_grid <- expand.grid(
+  n = c(250, 500),
+  hetero_effect = c(TRUE, FALSE),
+  nonlinear_prognostic = c(TRUE, FALSE),
+  stringsAsFactors = FALSE
+)
+
+# run function over the grid
+final_results <- pmap_dfr(
+    combo_grid,
+    run_sim,
+    num_rep = 200
+  )
+
+# results for BART
+write.csv(final_results, file = "results/BART_results.csv", row.names = FALSE)
+print(final_results)
+```
+
